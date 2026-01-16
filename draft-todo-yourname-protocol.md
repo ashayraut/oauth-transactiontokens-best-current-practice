@@ -40,16 +40,16 @@ This document provides best current practices for implementing and deploying OAu
 # Introduction
 
 ## Background
-Modern distributed systems built on Service Oriented Architecture (SOA) face a fundamental challenge: maintaining security context as requests traverse multiple service boundaries. When an external actor initiates an API request, the user identity and authorization context must be preserved and made available to all downstream workloads involved in processing that request. Without a standardized mechanism, organizations resort to ad-hoc solutions that introduce security vulnerabilities, operational complexity, and interoperability challenges.
+Modern distributed systems built on microservice architectures face a fundamental challenge: maintaining security context as requests traverse multiple service boundaries. When an external actor initiates an API request, the user identity and authorization context must be preserved and made available to all downstream internal microservices involved in processing that request. Without a standardized mechanism, organizations resort to ad-hoc solutions that introduce security vulnerabilities, operational complexity, and interoperability challenges.
 
-The OAuth 2.0 Transaction Tokens specification (draft-ietf-oauth-transaction-tokens) addresses this challenge by defining a token format and exchange protocol that enables secure context propagation within trusted domains. However, the specification focuses on protocol mechanics rather than deployment practices. Real-world implementations face additional challenges including latency constraints, token size limitations, schema evolution, propagation reliability, and operational monitoring.
+The OAuth 2.0 Transaction Tokens specification (draft-ietf-oauth-transaction-tokens) addresses this challenge by defining a token format and exchange protocol that enables secure context propagation across internal microservices within trusted domains. However, the specification focuses on protocol mechanics rather than deployment practices. Real-world implementations face additional challenges including latency constraints, token size limitations, schema evolution, propagation reliability, and operational monitoring.
 
 ## Purpose of the BCP
-This Best Current Practice document provides implementers with guidance derived from production deployments of Txn-Token systems. It addresses practical considerations that fall outside the scope of the protocol specification but are critical for successful deployment. The recommendations in this document are based on operational experience with large-scale SOA environments where hundreds of services must coordinate security context propagation across complex call chains.
+This Best Current Practice document provides implementers with guidance derived from production deployments of Txn-Token systems. It addresses practical considerations that fall outside the scope of the protocol specification but are critical for successful deployment. The recommendations in this document are based on operational experience with large-scale microservice environments where hundreds of internal microservices must coordinate security context propagation across complex call chains.
 
 This BCP is intended for:
 - Organizations implementing Transaction Token Services
-- Service developers integrating Txn-Token support
+- internal microservice developers integrating Txn-Token support
 - Security architects designing authorization systems
 - Operations teams monitoring token propagation
 
@@ -60,12 +60,11 @@ This BCP is intended for:
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in RFC 2119.
 This document uses terminology from draft-ietf-oauth-transaction-tokens including "Transaction Token" (Txn-Token), "Transaction Token Service", "trusted domain", and "authorization context".
 
+
 # Best Current Practices
 ## Transaction Token Service Implementation
 ### Service Architecture
-Requesting Txn-Tokens from a dedicated Transaction Token Service introduces latency and creates a new failure point in the request path. Organizations SHOULD prefer architectures where the authorization service that authenticates and authorizes external actors also functions as the Transaction Token Service. When the authorization service authenticates an actor at the external endpoint, it can issue the Txn-Token as part of the same operation, eliminating an additional network round-trip.
-
-This architectural pattern provides several benefits. First, it reduces latency by combining authentication, authorization, and token issuance into a single operation. Second, it simplifies failure mode analysis by avoiding dependencies on separate token services. Third, it ensures that token issuance occurs at the trust boundary where complete context about the external actor is available.
+Organizations SHOULD setup Transaction Token Service (TTS) which hosts functionality to issue token, replace token and other Txn-Token related functionality. Organizations SHOULD prefer architectures where the authorization service that authenticates and authorizes external actors, invokes the TTS for getting Transaction Token as part of authentication and authorization requests and pass Txn-token as well with it. This way, it avoids an explicit calls from external endpoint to TTS and lesser code changes in external services. Additionally, all internal microservices that want to replace tokens SHOULD connect directly to TTS. This architecture strikes balance between the options to either have authorization service host all TTS functionality or external services needing to connect TTS.
 
 ### Context Selection
 Transaction Token Services MUST include all mandatory claims defined in draft-ietf-oauth-transaction-tokens. However, services SHOULD NOT include all optional contexts by default. Optional contexts such as transaction context (tctx) or custom claims MUST be added only when explicitly requested.
@@ -81,7 +80,7 @@ Organizations SHOULD implement monitoring on token size to detect trends toward 
 ### Context Relocation
 When authorization context exceeds 4KB, Transaction Token Services SHOULD implement a relocation endpoint. The service stores oversized contexts in a separate data store using the Txn-Token identifier as the primary key. The Txn-Token itself contains only a reference to the relocated context.
 
-Client libraries for token validation SHOULD transparently handle context relocation. When a service requests a context that has been relocated, the library fetches it from the relocation endpoint. This pattern mirrors Policy Information Points in Attribute-Based Access Control (ABAC) systems where additional attributes are retrieved at runtime.
+Client libraries for token validation SHOULD transparently handle context relocation. When an internal microservice requests a context that has been relocated, the library fetches it from the relocation endpoint. This pattern mirrors Policy Information Points in Attribute-Based Access Control (ABAC) systems where additional attributes are retrieved at runtime.
 
 Context relocation introduces additional latency and failure modes. Organizations SHOULD treat relocation as an exception rather than the normal case. Monitoring SHOULD track relocation frequency to identify services that consistently require excessive context.
 
@@ -107,12 +106,12 @@ Backward compatibility testing becomes increasingly important as the number of s
 
 ## Token Propagation
 ### Propagation Control
-Organizations MUST prevent Txn-Tokens from propagating outside the trusted domain. While tokens contain encrypted sensitive data, organizations SHOULD implement explicit controls to block external propagation. Propagation libraries MUST detect when a service attempts to include a Txn-Token in a request to an external endpoint and MUST remove the token from that request.
+Organizations MUST prevent Txn-Tokens from propagating outside the trusted domain. While tokens contain encrypted sensitive data, organizations SHOULD implement explicit controls to block external propagation. Propagation libraries MUST detect when an internal microservice attempts to include a Txn-Token in a request to an external endpoint and MUST remove the token from that request.
 
 This defense-in-depth approach protects against misconfiguration and implementation errors. Even if token encryption remains secure, preventing external propagation eliminates entire classes of potential vulnerabilities.
 
 ### Propagation Libraries
-Organizations SHOULD provide standardized propagation libraries that handle token lifecycle within service request processing. These libraries MUST extract the Txn-Token from the incoming HTTP header, store it in request-scoped memory, add the token to outgoing request headers, and clear it from memory when request processing completes.
+Organizations SHOULD provide standardized propagation libraries that handle token lifecycle within an internal microservice workload processing. These libraries MUST extract the Txn-Token from the incoming HTTP header, store it in request-scoped memory, add the token to outgoing request headers, and clear it from memory when request processing completes.
 
 Standardized libraries provide several benefits. First, they enforce propagation controls including external blocking to avoid the token flowing outside your trust boundary. Second, they can be used to consistently emit telemetry about token initiation, propagation, and validation. Third, they provide a centralized point for implementing fallback behaviors when tokens are missing.
 
@@ -134,9 +133,9 @@ When requests cross trust boundaries within the organization, propagation librar
 At trust boundaries, services MAY request new Txn-Tokens from the Transaction Token Service with contexts appropriate for the target trust domain. This approach maintains context propagation while respecting security boundaries.
 
 ### Cache Considerations
-The introduction of Txn-token provides more information now to the entire service graph. There are Services in the graph that cache data to avoid calling dependent services multiple times. Now, they SHOULD consider Txn-Token contexts to be included in the cache keys. If not included, there is a risk that incorrect data is vended out or cache hit is impacted because the dependent services might be using the Txn-Token contexts for computing the results which might get cached.
+The introduction of Txn-token provides more information now to the entire microservice architecture graph. There are Services in the graph that cache data to avoid calling dependent services multiple times. Now, they SHOULD consider Txn-Token contexts to be included in the cache keys. If not included, there is a risk that incorrect data is vended out or cache hit is impacted because the dependent services might be using the Txn-Token contexts for computing the results which might get cached.
 
-Organizations SHOULD provide guidance to service developers on cache key construction when Txn-Tokens are involved. Cache invalidation strategies MUST account for context changes that affect cached data.
+Organizations SHOULD provide guidance to workload developers on cache key construction when Txn-Tokens are involved. Cache invalidation strategies MUST account for context changes that affect cached data.
 
 ## Token Validation
 ### Validation Libraries
@@ -156,7 +155,7 @@ The appropriate fallback depends on the sensitivity of the requested operation. 
 ### Adoption Monitoring
 Transaction token adoption in large SOA environments takes time. Organizations SHOULD implement comprehensive telemetry to monitor adoption progress, propagation reliability, and validation patterns.
 
-When organizations provide standardized libraries for token initiation, propagation, and validation, telemetry logic SHOULD be embedded in those libraries. This approach ensures consistent telemetry across all services without requiring individual service implementations.
+When organizations provide standardized libraries for token initiation, propagation, and validation, telemetry logic SHOULD be embedded in those libraries. This approach ensures consistent telemetry across all services without requiring individual workload implementations.
 
 ### Telemetry Aggregation
 Services SHOULD aggregate telemetry locally before transmitting to centralized monitoring systems. Local aggregation reduces network overhead and enables higher-frequency sampling without overwhelming monitoring infrastructure.
@@ -179,6 +178,33 @@ Organizations MUST implement secure key management practices for Txn-Token crypt
 
 Transaction Token Services MUST support key rotation without service disruption. Validation libraries MUST support multiple concurrent keys to enable zero-downtime rotation. Organizations SHOULD automate key rotation on a regular schedule.
 
+## Batch Processing pattern
+OAuth Transaction Tokens are designed to propagate security context through a call chain within a trust domain. To maintain a high security posture without the overhead of a global revocation infrastructure, these tokens are short-lived (typically minutes). In many modern architectures, a transaction may be asynchronous. For example, a request may be placed on a message queue (e.g., Kafka, RabbitMQ) and processed by a worker service hours or days later. By the time the worker resumes the transaction, the original Transaction Token has expired.
+   
+Batch Token (Voucher): A long-lived, opaque, or encrypted token representing the transaction context during a period of rest.
+Initiator: The internal microservice that receives a Transaction Token and requests a Batch Token before an asynchronous pause.
+Rehydrator: The internal microservice that takes a Batch Token and exchanges it for a fresh, short-lived Transaction Token to resume processing.
+
+### Initiation (Pausing the Transaction)
+
+When a internal microservice determines that a transaction will exceed the TTL of the current Transaction Token (TraT), it SHOULD request a Batch Token from the Transaction Token Service (TTS).
+The request to the TTS SHOULD include:
+   * The current valid TraT.
+   * The intended "use case ID" or "namespace" to constrain the token.
+
+The TTS returns a Batch Token with a TTL suitable for the asynchronous delay (e.g., 24 hours to 7 days).
+
+### Rehydration (Resuming the Transaction)
+
+When a worker service (the Rehydrator) picks up the task, it MUST NOT use the Batch Token directly to call downstream services. Instead, it MUST exchange the Batch Token at the TTS for a fresh TraT.
+The TTS SHALL:
+   1.  Verify the Batch Token's signature and expiration.
+   2.  Validate that the Rehydrator is authorized for the specific 
+       "use case ID" or "namespace" embedded in the Batch Token.
+   3.  Issue a new, short-lived TraT containing the original 
+       claims (e.g., subject, original requester IP).
+
+
 # Security Considerations
 
 ## Token Mix-up Prevention
@@ -199,6 +225,21 @@ Short token lifetimes reduce the window for token compromise but may cause opera
 ## External Propagation
 Preventing Txn-Tokens from leaving the trusted domain is critical. Organizations MUST implement multiple layers of defense including library-level controls, network-level filtering, and monitoring for external propagation attempts.
 
+## Batch processing security consideration
+
+### Token Constraining
+
+Batch Tokens MUST be sender-constrained or scoped to specific namespaces. This prevents a compromised service from "stealing" a Batch Token from a queue and successfully minting a 
+Transaction Token for an unrelated flow.
+
+### Data Mutability and Consent
+
+Asynchronous delays increase the risk that the underlying authorization context has changed (e.g., a user has revoked consent). The TTS SHOULD perform a "freshness check" during 
+rehydration for claims marked as mutable or sensitive.
+
+### Infinite Exchange Prevention
+
+To prevent a transaction from living indefinitely through repeated rehydrations, the TTS SHOULD implement a maximum chain depth or total transaction lifetime counter within the token metadata.
 
 # IANA Considerations
 
