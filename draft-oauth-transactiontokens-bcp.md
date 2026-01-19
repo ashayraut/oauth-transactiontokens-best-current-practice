@@ -2,7 +2,7 @@
 title: "OAuth Transaction Tokens Best Current Practice"
 category: info
 
-docname: oauth-transactiontokens-best-current-practice-latest
+docname: draft-oauth-transactiontokens-bcp-00
 submissiontype: IETF  # also: "independent", "editorial", "IAB", or "IRTF"
 number:
 date:
@@ -247,12 +247,12 @@ This document has no IANA actions.
 
 # References
 ## Normative References
-[RFC2119] Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, DOI 10.17487/RFC2119, March 1997.
+[RFC2119](https://datatracker.ietf.org/doc/html/rfc2119) Bradner, S., "Key words for use in RFCs to Indicate Requirement Levels", BCP 14, RFC 2119, DOI 10.17487/RFC2119, March 1997.
 
-[TXNTOKENS] Tulshibagwale, A., Hardt, D., and G. Fletcher, "OAuth 2.0 Transaction Tokens", draft-ietf-oauth-transaction-tokens-06 (work in progress).
+[TXNTOKENS](https://www.ietf.org/archive/id/draft-ietf-oauth-transaction-tokens-06.html) Tulshibagwale, A., Hardt, D., and G. Fletcher, "OAuth 2.0 Transaction Tokens", draft-ietf-oauth-transaction-tokens-06 (work in progress).
 
 ## Informative References
-[RFC4107] Bellovin, S. and R. Housley, "Guidelines for Cryptographic Key Management", BCP 107, RFC 4107, DOI 10.17487/RFC4107, June 2005.
+[RFC4107](https://datatracker.ietf.org/doc/html/rfc4107) Bellovin, S. and R. Housley, "Guidelines for Cryptographic Key Management", BCP 107, RFC 4107, DOI 10.17487/RFC4107, June 2005.
 
 --- back
 
