@@ -508,24 +508,11 @@ The TTS SHALL:
    3.  Issue a new, short-lived TraT containing the original
        claims (e.g., subject, original requester IP).
 
-### Preservation Mode Selection
+### Async Context Preservation
 
-Organizations SHOULD support two preservation modes for async token contexts, selected based on security requirements:
+When preserving token contexts across asynchronous boundaries, organizations MUST use server-side signed preservation via the TTS. The TTS issues an ECDSA-signed preservation context that provides tamper detection and centralized audit. Client-side unsigned preservation MUST NOT be used — all async context preservation requires cryptographic integrity guarantees.
 
-| Mode | Characteristics | Use Case |
-|------|----------------|----------|
-| **Local (unsigned)** | Client-side only, no network call, no cryptographic signature, fast | Contexts that only need identity propagation without tamper-proof guarantees (e.g., line-of-business metadata) |
-| **Remote (signed)** | Server-side via TTS, ECDSA-signed, requires network call | All contexts requiring full security guarantees, tamper detection, and centralized audit |
-
-#### Mode Selection Logic
-
-When determining which mode to use:
-1. If a preservation context already exists in the request -> route to remote (signed) preservation
-2. If only locally-preservable contexts are present -> local mode is acceptable
-3. If any context requires server-side signing -> route to remote preservation
-4. When in doubt -> default to remote (signed) preservation
-
-#### Message Transport
+### Message Transport
 
 For message-based async (SQS, SNS, Kafka), preserved context SHOULD be transported as a message attribute rather than embedded in the message body:
 - Attribute name SHOULD be standardized (e.g., `x-transaction-token-preservation-context`)
@@ -582,9 +569,6 @@ Validation libraries MUST be able to quickly identify token type (real token vs 
 - Fast-path rejection of placeholder tokens in strict enforcement mode
 - Per-type metrics without expensive decode operations
 - Efficient routing to format-specific decoders
-
-## Supplement Expiration
-Token supplements (overrides) attached to tokens MUST have independent expiration. Expired supplements MUST be rejected even if the base token is still valid. This prevents stale modifications from being honored indefinitely.
 
 # IANA Considerations
 
