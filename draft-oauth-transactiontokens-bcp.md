@@ -89,7 +89,9 @@ Transaction tokens SHOULD have a time-to-live of less than 5 minutes. Organizati
 
 Short token lifetimes reduce the window for token compromise and limit the impact of token mix-up scenarios. However, lifetimes must accommodate the longest expected call chains in the SOA. Organizations SHOULD measure actual request processing times and set token lifetimes to exceed the 99th percentile by a reasonable margin.
 
-When tokens expire during request processing, services MUST NOT automatically request new tokens. Expired tokens indicate either excessively long call chains or performance problems that require investigation. Services SHOULD fail requests with expired tokens and emit telemetry for operational monitoring.
+While the TTS MAY support per-use-case token lifetimes, organizations SHOULD prefer a single uniform lifetime across all use cases. Per-use-case lifetimes add configuration complexity and make it harder to reason about expiration behavior across call chains. A uniform lifetime simplifies operations and enables centralized tracking of expired tokens.
+
+When tokens expire during request processing, services MUST NOT automatically request new tokens. Expired tokens indicate either excessively long call chains or performance problems that require investigation. Services SHOULD fail requests with expired tokens and emit telemetry for operational monitoring. Organizations SHOULD track token expiration centrally to identify which services or call chains consistently produce expired tokens and why — enabling targeted investigation rather than blanket lifetime increases.
 
 ## Schema Governance
 ### Context Visibility
@@ -163,7 +165,6 @@ Not all languages need identical feature sets. Organizations SHOULD prioritize:
 | Token validation | High priority (Java first, others as needed) |
 | Token issuance | Server-side only — language of TTS |
 | Async preservation | Based on async workload patterns per language |
-| Token modification/override | Based on intermediate service patterns |
 
 #### Telemetry Consistency
 
@@ -316,40 +317,6 @@ When the disable switch is active:
 - A disabled propagation path MUST NOT generate errors or exceptions — it simply becomes invisible
 - Organizations SHOULD alert when a disable switch has been active for extended periods (indicating a forgotten workaround)
 
-### Token Context Modification
-Intermediate services in a call chain sometimes need to modify token contexts for downstream calls without requesting a completely new token from the TTS. Organizations SHOULD support a token modification mechanism for this use case.
-
-#### Use Cases
-
-- Adding line-of-business (LOB) context for specific downstream services
-- Narrowing authorization scope before calling a less-trusted downstream
-- Adding operational metadata (e.g., "doing business as" identifiers) required by specific downstream APIs
-
-#### Modification vs Exchange
-
-| Aspect | Token Modification | Token Exchange (re-issuance) |
-|--------|-------------------|------------------------------|
-| When | Automatic during propagation | Explicit service code call |
-| Who decides | Configuration (per downstream target) | Service developer |
-| Network call | Yes (signed supplement from TTS) | Yes (full token from TTS) |
-| Result | Original token + appended supplement | Brand new token |
-| Latency impact | Lower (supplement is smaller) | Higher (full issuance) |
-
-Organizations SHOULD prefer modification over exchange when only adding context, and prefer exchange when replacing or significantly altering token contents.
-
-#### Configuration Model
-
-Token modification SHOULD be configurable per downstream target:
-- Which downstream services trigger modification
-- What context to add/override for each target
-- Failure mode: propagate placeholder token, propagate original token, or fail the request
-
-#### Security Requirements
-
-- Modifications MUST be cryptographically signed by the TTS
-- The intermediate service's identity MUST be embedded in the modification (traceability)
-- Only explicitly authorized namespaces (e.g., LOB) SHOULD be modifiable — general-purpose context modification introduces security risks
-
 ### Cache Considerations
 The introduction of Txn-token provides more information now to the entire microservice architecture graph. There are Services in the graph that cache data to avoid calling dependent services multiple times. Now, they SHOULD consider Txn-Token contexts to be included in the cache keys. If not included, there is a risk that incorrect data is vended out or cache hit is impacted because the dependent services might be using the Txn-Token contexts for computing the results which might get cached.
 
@@ -465,10 +432,6 @@ Security event entries SHOULD include:
 - **Timestamp and request identifier**
 
 For placeholder tokens, log the issuer service name and upstream client name to trace propagation breaks.
-
-#### Override Context Priority
-
-When token modification (override) contexts exist alongside the original decoded contexts, the override context SHOULD take precedence in the security event log. This ensures the audit trail reflects the effective authorization state, not the original state.
 
 #### Failure Resilience
 
