@@ -104,37 +104,6 @@ Organizations MUST implement backward compatibility tests for Txn-Token contexts
 
 Backward compatibility testing becomes increasingly important as the number of services consuming Txn-Tokens grows. Without automated verification, format changes risk cascading failures across the SOA.
 
-### Field-Level Constraints
-Schema-level access control (where a service can either read an entire context or nothing) is insufficient for production systems. Organizations SHOULD implement field-level constraints that allow upstream services to restrict which specific fields within a context downstream services can access.
-
-#### Motivation
-
-- **Cache corruption prevention**: When new fields are added to an existing context, downstream services caching based on that context may produce stale results. Field-level constraints let upstreams limit exposure to only the fields the downstream actually uses for its cache key.
-- **Least privilege / PII exposure**: Schema-level constraints are all-or-nothing. Granting access to any field grants the entire context, including PII the downstream does not need.
-
-#### Implementation Guidance
-
-Organizations SHOULD support two constraint granularities:
-
-1. **Schema-level constraints**: The downstream service can access the entire context schema, or nothing. This is the minimum viable implementation.
-2. **Field-level constraints**: The downstream can access only specific named fields within a schema. Access to non-permitted fields returns empty/null.
-
-When multiple upstream services apply constraints (e.g., in a multi-hop call chain), the effective constraint SHOULD be the **intersection** of all applied constraints. A field is accessible only if permitted by every constrainer in the chain.
-
-#### Shadow Mode for Constraints
-
-Constraint violations SHOULD support shadow mode evaluation: the violation is logged and metricked but access is not actually denied. This allows safe rollout of new constraints without breaking downstream services.
-
-Organizations SHOULD implement shadow mode constraints before enforcing them in production. The rollout path is:
-1. Deploy constraint in shadow mode -> observe metrics
-2. Identify impacted downstream services from telemetry
-3. Coordinate with impacted teams or add their fields to the allowed set
-4. Promote to enforcement
-
-#### Constraint Attachment
-
-Constraints SHOULD be attached to the token itself (e.g., as signed supplements appended after a delimiter) rather than being a property of the service mesh configuration. This ensures constraints travel with the token and are enforced regardless of the network path.
-
 ## Token Propagation
 ### Propagation Control
 Organizations MUST prevent Txn-Tokens from propagating outside the trusted domain. While tokens contain encrypted sensitive data, organizations SHOULD implement explicit controls to block external propagation. Propagation libraries MUST detect when an internal microservice attempts to include a Txn-Token in a request to an external endpoint and MUST remove the token from that request.
@@ -608,14 +577,6 @@ rehydration for claims marked as mutable or sensitive.
 
 To prevent a transaction from living indefinitely through repeated rehydrations, the TTS SHOULD implement a maximum chain depth or total transaction lifetime counter within the token metadata.
 
-## Constraint Bypass Prevention
-Organizations MUST ensure that services cannot bypass field-level or schema-level constraints by:
-- Accessing raw token bytes directly (instead of using the validated decode API)
-- Disabling constraint enforcement without authorization
-- Passing tokens through side channels that skip constraint evaluation
-
-Constraint enforcement SHOULD be enabled by default. Disabling constraint enforcement SHOULD require explicit configuration with audit logging.
-
 ## Token Format Identification
 Validation libraries MUST be able to quickly identify token type (real token vs placeholder vs handle) without performing full decryption. This enables:
 - Fast-path rejection of placeholder tokens in strict enforcement mode
@@ -623,7 +584,7 @@ Validation libraries MUST be able to quickly identify token type (real token vs 
 - Efficient routing to format-specific decoders
 
 ## Supplement Expiration
-Token supplements (constraints, overrides) attached to tokens MUST have independent expiration. Expired supplements MUST be rejected even if the base token is still valid. This prevents stale constraints from being honored indefinitely.
+Token supplements (overrides) attached to tokens MUST have independent expiration. Expired supplements MUST be rejected even if the base token is still valid. This prevents stale modifications from being honored indefinitely.
 
 # IANA Considerations
 
