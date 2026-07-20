@@ -2,7 +2,7 @@
 title: "OAuth Transaction Tokens Best Current Practice"
 category: info
 
-docname: draft-oauth-transactiontokens-bcp-00
+docname: draft-araut-oauth-transactiontokens-bcp-00
 submissiontype: IETF  # also: "independent", "editorial", "IAB", or "IRTF"
 number:
 date:
@@ -104,21 +104,177 @@ Organizations MUST implement backward compatibility tests for Txn-Token contexts
 
 Backward compatibility testing becomes increasingly important as the number of services consuming Txn-Tokens grows. Without automated verification, format changes risk cascading failures across the SOA.
 
+### Field-Level Constraints
+Schema-level access control (where a service can either read an entire context or nothing) is insufficient for production systems. Organizations SHOULD implement field-level constraints that allow upstream services to restrict which specific fields within a context downstream services can access.
+
+#### Motivation
+
+- **Cache corruption prevention**: When new fields are added to an existing context, downstream services caching based on that context may produce stale results. Field-level constraints let upstreams limit exposure to only the fields the downstream actually uses for its cache key.
+- **Least privilege / PII exposure**: Schema-level constraints are all-or-nothing. Granting access to any field grants the entire context, including PII the downstream does not need.
+
+#### Implementation Guidance
+
+Organizations SHOULD support two constraint granularities:
+
+1. **Schema-level constraints**: The downstream service can access the entire context schema, or nothing. This is the minimum viable implementation.
+2. **Field-level constraints**: The downstream can access only specific named fields within a schema. Access to non-permitted fields returns empty/null.
+
+When multiple upstream services apply constraints (e.g., in a multi-hop call chain), the effective constraint SHOULD be the **intersection** of all applied constraints. A field is accessible only if permitted by every constrainer in the chain.
+
+#### Shadow Mode for Constraints
+
+Constraint violations SHOULD support shadow mode evaluation: the violation is logged and metricked but access is not actually denied. This allows safe rollout of new constraints without breaking downstream services.
+
+Organizations SHOULD implement shadow mode constraints before enforcing them in production. The rollout path is:
+1. Deploy constraint in shadow mode -> observe metrics
+2. Identify impacted downstream services from telemetry
+3. Coordinate with impacted teams or add their fields to the allowed set
+4. Promote to enforcement
+
+#### Constraint Attachment
+
+Constraints SHOULD be attached to the token itself (e.g., as signed supplements appended after a delimiter) rather than being a property of the service mesh configuration. This ensures constraints travel with the token and are enforced regardless of the network path.
+
 ## Token Propagation
 ### Propagation Control
 Organizations MUST prevent Txn-Tokens from propagating outside the trusted domain. While tokens contain encrypted sensitive data, organizations SHOULD implement explicit controls to block external propagation. Propagation libraries MUST detect when an internal microservice attempts to include a Txn-Token in a request to an external endpoint and MUST remove the token from that request.
 
 This defense-in-depth approach protects against misconfiguration and implementation errors. Even if token encryption remains secure, preventing external propagation eliminates entire classes of potential vulnerabilities.
 
+### Propagation Denylist
+In addition to preventing external propagation, organizations SHOULD maintain a denylist of internal services that MUST NOT participate in token propagation. This addresses scenarios where specific services within the trusted domain should not receive or forward tokens due to architectural constraints, security requirements, or known incompatibilities.
+
+#### Use Cases for Denylisting
+
+- Services undergoing decommissioning that cannot be updated to handle tokens correctly
+- Internal services that proxy to external endpoints (defense in depth)
+- Services with known token handling bugs that cannot be immediately fixed
+- Shared infrastructure services where token propagation creates unintended authorization coupling
+
+#### Implementation
+
+The denylist SHOULD be:
+- Evaluated before any token propagation logic executes
+- Configured at service startup (not changeable per-request)
+- Checked case-insensitively against the service's canonical identifier
+- Applied as a fail-safe — denylisted services return no-op results for all propagation operations
+
+When a service is on the denylist, propagation libraries MUST:
+- Not extract tokens from incoming requests
+- Not attach tokens to outgoing requests
+- Not generate placeholder tokens
+- Log that propagation was skipped due to denylist membership
+
 ### Propagation Libraries
 Organizations SHOULD provide standardized propagation libraries that handle token lifecycle within an internal microservice workload processing. These libraries MUST extract the Txn-Token from the incoming HTTP header, store it in request-scoped memory, add the token to outgoing request headers, and clear it from memory when request processing completes.
 
 Standardized libraries provide several benefits. First, they enforce propagation controls including external blocking to avoid the token flowing outside your trust boundary. Second, they can be used to consistently emit telemetry about token initiation, propagation, and validation. Third, they provide a centralized point for implementing fallback behaviors when tokens are missing.
 
+### Multi-Language Propagation Considerations
+Different programming languages have fundamentally different concurrency models that affect propagation library design. Organizations supporting polyglot architectures MUST account for these differences.
+
+#### Language-Specific Token Storage
+
+| Language | Recommended Storage Mechanism | Cross-Async Behavior |
+|----------|-------------------------------|---------------------|
+| Java | ThreadLocal + framework-specific transaction context | Requires explicit StateCaptor or framework agent for cross-thread propagation |
+| Python | `ContextVar` | Natively propagates across `async`/`await` boundaries — no explicit cross-thread logic needed |
+| NodeJS | `AsyncLocalStorage` | Natively propagates across async callbacks and promises — no explicit cross-thread logic needed |
+| Go | `context.Context` | Propagates naturally via context passing — no thread-local issues |
+
+#### Feature Parity Expectations
+
+Not all languages need identical feature sets. Organizations SHOULD prioritize:
+
+| Capability | Priority |
+|-----------|----------|
+| Token storage + propagation | **Required** in all languages |
+| Domain allowlist | **Required** in all languages |
+| Disable switch | **Required** in all languages |
+| Token validation | High priority (Java first, others as needed) |
+| Token issuance | Server-side only — language of TTS |
+| Async preservation | Based on async workload patterns per language |
+| Token modification/override | Based on intermediate service patterns |
+
+#### Telemetry Consistency
+
+Despite different implementations, all language SDKs MUST emit semantically equivalent metrics with consistent naming conventions. This enables cross-language monitoring dashboards and comparable adoption tracking.
+
+### Cross-Thread Propagation
+Modern services use thread pools, async executors, and non-blocking frameworks where request processing spans multiple threads. Token storage based on thread-local variables does NOT automatically propagate to child threads. Organizations MUST address this.
+
+#### The Problem
+
+When a service spawns child threads (via thread pools, async executors, or reactive frameworks), the token in the parent thread's storage is not automatically inherited. Without explicit propagation, child threads have no token — breaking the authentication chain for any downstream calls they make.
+
+#### Solution: Capture-Restore Pattern
+
+Propagation libraries SHOULD implement a state capture pattern:
+
+```
+Parent Thread                          Child Thread
+|                                      |
++-- Capture: snapshot current token    |
+|                                      |
+|                                      +-- Restore: set captured token
+|                                      |   into child's storage
+|                                      |
+|                                      +-- Execute: child runs with
+|                                      |   propagated token
+|                                      |
+|                                      +-- Cleanup: clear child's storage
+|                                      |   (prevent leak to next task)
+```
+
+#### Key Behaviors
+
+- The captured token is a **snapshot** at capture time — subsequent changes on the parent thread are NOT reflected in the child
+- Null/empty tokens SHOULD be propagated gracefully (no error)
+- Cleanup MUST always run regardless of success or failure (prevents leaks on reused pool threads)
+- The capture mechanism SHOULD be auto-discovered (e.g., via service loader or framework hooks) — no explicit wiring by service developers
+
+#### Fire-and-Forget Pattern
+
+For fire-and-forget async patterns (where the parent thread completes and responds before the child finishes):
+- Parent thread clearing its storage at request end MUST NOT affect the child thread's copy
+- The token storage implementation MUST support reference semantics where the child retains access even after the parent's cleanup
+- This is a critical design consideration — naive "clear all" implementations will break fire-and-forget
+
 ### Propagation Reliability
 Organizations SHOULD monitor propagation success rates across the SOA. Unless propagation success reaches 100% for a given call chain, services cannot reliably enforce authorization policies based on Txn-Token contents. Services MUST implement reasonable fallback behaviors when tokens are absent.
 
 Propagation libraries MAY implement automatic token initiation when an incoming request lacks a Txn-Token. The library requests a placeholder token from the Transaction Token Service indicating that no context was received at the current service. This placeholder enables downstream services to identify where propagation broke in the call chain, facilitating operational debugging.
+
+### Placeholder Token Design
+Placeholder tokens serve as diagnostic markers that identify WHERE propagation broke in a call chain. They are NOT authorization tokens and MUST NOT be used for access decisions.
+
+#### Placeholder Token Contents
+
+Placeholder tokens SHOULD contain:
+- `issuerServiceName` — the service that generated the placeholder (where the break was detected)
+- `clientName` — the upstream caller that failed to propagate a real token
+- `issuedAt` — timestamp of generation
+- `reasonCode` — why the real token is missing
+
+#### Reason Codes
+
+| Code | Meaning |
+|------|---------|
+| `TOKEN_NOT_PRESENT` | No token in incoming request headers |
+| `TOKEN_GENERATION_ERROR` | Token generation/issuance failed |
+| `UNSUPPORTED_REGION` | Service is in a region that doesn't support Txn-Tokens |
+| `UNKNOWN` | Reason could not be determined |
+
+#### Placeholder Token Properties
+
+- Placeholder tokens MUST NOT be cryptographically signed — they have no security value
+- Validators encountering placeholder tokens SHOULD emit per-issuer metrics to identify which services are generating them
+- APIs that extract details from placeholder tokens SHOULD be explicitly named to signal unreliability (e.g., `getUnsafePlaceholderDetails()`)
+- Placeholder tokens SHOULD be distinguishable from real tokens via a format version identifier (O(1) check, no full decode needed)
+
+#### Auto-Generation at Potential Entry Points
+
+Services that might be the first in a call chain (potential initiators) SHOULD automatically generate a placeholder token if no token arrives. This distinguishes "I am the entry point and no token was issued" from "someone upstream broke propagation."
 
 ### Token Mix-up Prevention
 Token mix-up represents the most severe propagation risk. Mix-up occurs when a token intended for one request is incorrectly attached to a different request. If token T1 is meant for request R1 and token T2 for request R2, but T2 is sent with R1 due to a propagation bug, actors may access data they are not authorized to see.
@@ -127,10 +283,103 @@ Token mix-up scenarios are difficult to detect because they may not cause obviou
 
 Organizations SHOULD implement testing strategies that deliberately attempt to cause token mix-up under concurrent load. These tests verify that propagation libraries correctly isolate tokens across concurrent requests.
 
+### Token Leak Detection
+Beyond preventing mix-up during concurrent requests, organizations MUST implement leak detection at request boundaries. A "leak" occurs when a token from a previous request remains in storage when a new, unrelated request arrives — meaning one request's credentials could bleed into another's authorization context.
+
+#### Detection Mechanism
+
+At the start of every incoming request, propagation libraries SHOULD check whether a leftover Txn-Token is already present in request-scoped storage before the new request's token is stored:
+
+```
+New request arrives
+  -> Check: is a token already in storage?
+  -> YES -> Leak detected! Log safe identifiers + emit metric
+  -> NO -> Clean state, proceed normally
+```
+
+#### Detection vs Prevention
+
+Leak detection is distinct from leak prevention:
+- **Detection**: Identifies that a leak occurred (observability)
+- **Prevention**: Mechanisms that ensure cleanup happens (see request lifecycle cleanup)
+
+Both are required. Detection catches cases where prevention mechanisms fail.
+
+#### Metrics
+
+Organizations SHOULD emit a binary metric at request start:
+- Value `0` = clean state (no leftover token)
+- Value `1` = leak detected (token from previous request still present)
+
+Detection SHOULD log safe, non-sensitive identifiers of both the leftover token and the incoming token for debugging — never raw token values.
+
+#### Remediation
+
+Upon detecting a leak, propagation libraries SHOULD override the leaked token with the correct incoming token. Detection is observability-only — it SHOULD NOT block or fail the request. The incoming request's token takes precedence.
+
 ### Trust Boundary Handling
 When requests cross trust boundaries within the organization, propagation libraries MUST either block token propagation or replace token contents with appropriately scoped contexts. Organizations SHOULD define trust boundaries explicitly and configure propagation libraries with boundary detection logic.
 
 At trust boundaries, services MAY request new Txn-Tokens from the Transaction Token Service with contexts appropriate for the target trust domain. This approach maintains context propagation while respecting security boundaries.
+
+### Runtime Disable Switch
+Organizations MUST provide a runtime kill switch that can disable token propagation without requiring service restarts. In production incidents where token propagation is contributing to failures, operators need immediate relief.
+
+#### Requirements
+
+- Each propagation solution (e.g., per framework integration) SHOULD have an independent disable switch
+- Disable switches SHOULD be configurable via JVM system properties, environment variables, or dynamic configuration
+- Changes SHOULD take effect within a bounded interval (e.g., 180 seconds maximum polling interval)
+- All solutions MUST default to ENABLED on initialization
+- Disabling propagation SHOULD NOT cause request failures — requests proceed without tokens
+
+#### Operational Behavior When Disabled
+
+When the disable switch is active:
+- Incoming token extraction returns empty (tokens in headers are ignored)
+- Outgoing request header injection is skipped
+- Token storage operations become no-ops
+- Telemetry SHOULD still emit metrics indicating the disabled state
+
+#### Safety Constraints
+
+- Disable switches SHOULD require explicit opt-in registration before polling takes effect
+- A disabled propagation path MUST NOT generate errors or exceptions — it simply becomes invisible
+- Organizations SHOULD alert when a disable switch has been active for extended periods (indicating a forgotten workaround)
+
+### Token Context Modification
+Intermediate services in a call chain sometimes need to modify token contexts for downstream calls without requesting a completely new token from the TTS. Organizations SHOULD support a token modification mechanism for this use case.
+
+#### Use Cases
+
+- Adding line-of-business (LOB) context for specific downstream services
+- Narrowing authorization scope before calling a less-trusted downstream
+- Adding operational metadata (e.g., "doing business as" identifiers) required by specific downstream APIs
+
+#### Modification vs Exchange
+
+| Aspect | Token Modification | Token Exchange (re-issuance) |
+|--------|-------------------|------------------------------|
+| When | Automatic during propagation | Explicit service code call |
+| Who decides | Configuration (per downstream target) | Service developer |
+| Network call | Yes (signed supplement from TTS) | Yes (full token from TTS) |
+| Result | Original token + appended supplement | Brand new token |
+| Latency impact | Lower (supplement is smaller) | Higher (full issuance) |
+
+Organizations SHOULD prefer modification over exchange when only adding context, and prefer exchange when replacing or significantly altering token contents.
+
+#### Configuration Model
+
+Token modification SHOULD be configurable per downstream target:
+- Which downstream services trigger modification
+- What context to add/override for each target
+- Failure mode: propagate placeholder token, propagate original token, or fail the request
+
+#### Security Requirements
+
+- Modifications MUST be cryptographically signed by the TTS
+- The intermediate service's identity MUST be embedded in the modification (traceability)
+- Only explicitly authorized namespaces (e.g., LOB) SHOULD be modifiable — general-purpose context modification introduces security risks
 
 ### Cache Considerations
 The introduction of Txn-token provides more information now to the entire microservice architecture graph. There are Services in the graph that cache data to avoid calling dependent services multiple times. Now, they SHOULD consider Txn-Token contexts to be included in the cache keys. If not included, there is a risk that incorrect data is vended out or cache hit is impacted because the dependent services might be using the Txn-Token contexts for computing the results which might get cached.
@@ -143,6 +392,37 @@ Organizations SHOULD provide standardized validation libraries that handle signa
 
 Validation libraries SHOULD decode Txn-Tokens into strongly-typed objects appropriate for the implementation language. This approach prevents parsing errors and provides compile-time verification of context access patterns.
 
+### Key and Schema Caching
+Validation libraries MUST cache cryptographic keys and token schemas locally. Remote lookups on every validation request introduce unacceptable latency.
+
+#### Key Caching Requirements
+
+- Keys MUST be pre-fetched into local cache before validation requests arrive
+- Background refresh SHOULD run on a daemon thread at a fixed interval (e.g., every 1 hour) with jitter (+/-10%) to avoid thundering herd
+- Cache miss for a required key SHOULD NOT trigger a synchronous remote fetch — the token validation fails fast with a clear error code
+- Multiple concurrent keys MUST be supported to enable zero-downtime rotation (old key and new key both valid during transition)
+
+#### Schema Caching Requirements
+
+- Schemas define how token contexts are decoded. They MUST be cached locally.
+- Background refresh interval SHOULD be longer than key refresh (e.g., every 6 hours) since schemas change less frequently
+- A fresh schema parser instance SHOULD be used per deserialization to avoid cross-contamination between independently evolving schemas
+- Schema not in cache at validation time -> fail with a specific error code (e.g., `MISSING_SCHEMA`) — do NOT block waiting for a fetch
+
+#### Key Refresh Resilience
+
+- Background refresh failures MUST be caught and logged — they MUST NOT terminate the refresh scheduler
+- If the key management service is down, the last successfully fetched keys remain valid until they expire
+- Organizations SHOULD alert on consecutive refresh failures exceeding a threshold
+
+#### Environment-Specific Strategies
+
+| Environment | Strategy |
+|-------------|----------|
+| Long-running services | Background daemon thread with scheduled refresh |
+| Serverless / Lambda | Eager fetch on cold start; no background thread (short-lived process) |
+| Edge / resource-constrained | Configurable refresh intervals with larger TTLs |
+
 ### Error Handling
 Validation libraries SHOULD emit standardized error codes for common failure conditions including expired tokens, malformed tokens, and signature verification failures. These error codes enable consistent operational monitoring across the SOA.
 
@@ -150,6 +430,26 @@ Validation libraries SHOULD emit standardized error codes for common failure con
 Services SHOULD NOT automatically fail requests when Txn-Tokens are missing or invalid. Organizations MUST define fallback policies that balance security with user experience. Fallback policies MAY include serving redacted data, limiting functionality, or requesting step-up authentication.
 
 The appropriate fallback depends on the sensitivity of the requested operation. Services accessing highly sensitive data MAY require valid Txn-Tokens and fail requests when tokens are absent. Services providing less sensitive functionality SHOULD implement graceful degradation.
+
+### Verification Strategy Modes
+Organizations deploying Txn-Token validation MUST support at least three progressive enforcement modes that can be configured per-service and per-request:
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `SHADOW_MODE` | Token is decoded and validated but failures are only logged — never enforced. Requests always proceed. | Initial rollout, testing, measuring impact before enforcement |
+| `TOKEN_PRESENCE_MODE` | Token must be present in the request but no cryptographic verification is performed. Absence causes failure. | Intermediate enforcement — ensures propagation works before trusting content |
+| `STRICT_VERIFICATION_MODE` | Full cryptographic verification. Invalid or missing tokens cause request rejection. | Production enforcement after confidence is established |
+
+Organizations SHOULD default to SHADOW_MODE when first deploying validation and progressively tighten enforcement. The default mode SHOULD be configurable at both the service level and per-request level (e.g., based on API sensitivity or client identity).
+
+Validation libraries SHOULD emit distinct metrics for each mode so organizations can track:
+- How many requests WOULD fail under stricter enforcement
+- Per-client and per-error-code failure rates in shadow mode
+- Readiness percentage before promoting to stricter enforcement
+
+Error logs during shadow mode SHOULD be sampled (e.g., 50%) to prevent log flooding while still providing visibility into issues.
+
+Organizations MUST document and communicate enforcement promotion timelines to downstream service teams. Surprise enforcement changes cause outages.
 
 ## Telemetry and Monitoring
 ### Adoption Monitoring
@@ -173,14 +473,49 @@ Organizations SHOULD monitor the following key metrics:
 
 These metrics provide visibility into Txn-Token health across the SOA and enable rapid identification of deployment issues.
 
+### Token Validation Audit Trail
+Beyond operational telemetry, organizations MUST implement token validation audit logging that creates an audit trail for every token validation attempt.
+
+#### When to Log
+
+A security event MUST be generated after **every** validation attempt — regardless of success or failure. This includes:
+- Successful token validation (identity confirmed)
+- Failed validation (expired, malformed, bad signature)
+- Placeholder token encountered
+- Token absent when required
+
+#### What to Log
+
+Security event entries SHOULD include:
+- **Initiator identity** — the application/service that originally issued the token
+- **Subject identity** — the authenticated entity (end user, system) the token represents
+- **Requester line of business** — organizational context
+- **Customer/entity identifier** — if present in the token
+- **Token type** — real token vs placeholder vs auto-generated
+- **Validation status** — success, failure code, or skip reason
+- **Timestamp and request identifier**
+
+For placeholder tokens, log the issuer service name and upstream client name to trace propagation breaks.
+
+#### Override Context Priority
+
+When token modification (override) contexts exist alongside the original decoded contexts, the override context SHOULD take precedence in the security event log. This ensures the audit trail reflects the effective authorization state, not the original state.
+
+#### Failure Resilience
+
+Security event logging failures MUST NOT interrupt request processing. If the logging system is unavailable:
+- Emit a metric counting missed security events
+- Sample error logs (e.g., 50%) to avoid flooding
+- Never propagate the logging failure to callers
+
 ## Key Management
 Organizations MUST implement secure key management practices for Txn-Token cryptographic operations. Key management SHOULD follow the guidelines in RFC 4107 "Guidelines for Cryptographic Key Management".
 
 Transaction Token Services MUST support key rotation without service disruption. Validation libraries MUST support multiple concurrent keys to enable zero-downtime rotation. Organizations SHOULD automate key rotation on a regular schedule.
 
-## Batch Processing pattern
+## Batch Processing Pattern
 OAuth Transaction Tokens are designed to propagate security context through a call chain within a trust domain. To maintain a high security posture without the overhead of a global revocation infrastructure, these tokens are short-lived (typically minutes). In many modern architectures, a transaction may be asynchronous. For example, a request may be placed on a message queue (e.g., Kafka, RabbitMQ) and processed by a worker service hours or days later. By the time the worker resumes the transaction, the original Transaction Token has expired.
-   
+
 Batch Token (Voucher): A long-lived, opaque, or encrypted token representing the transaction context during a period of rest.
 Initiator: The internal microservice that receives a Transaction Token and requests a Batch Token before an asynchronous pause.
 Rehydrator: The internal microservice that takes a Batch Token and exchanges it for a fresh, short-lived Transaction Token to resume processing.
@@ -199,10 +534,42 @@ The TTS returns a Batch Token with a TTL suitable for the asynchronous delay (e.
 When a worker service (the Rehydrator) picks up the task, it MUST NOT use the Batch Token directly to call downstream services. Instead, it MUST exchange the Batch Token at the TTS for a fresh TraT.
 The TTS SHALL:
    1.  Verify the Batch Token's signature and expiration.
-   2.  Validate that the Rehydrator is authorized for the specific 
+   2.  Validate that the Rehydrator is authorized for the specific
        "use case ID" or "namespace" embedded in the Batch Token.
-   3.  Issue a new, short-lived TraT containing the original 
+   3.  Issue a new, short-lived TraT containing the original
        claims (e.g., subject, original requester IP).
+
+### Preservation Mode Selection
+
+Organizations SHOULD support two preservation modes for async token contexts, selected based on security requirements:
+
+| Mode | Characteristics | Use Case |
+|------|----------------|----------|
+| **Local (unsigned)** | Client-side only, no network call, no cryptographic signature, fast | Contexts that only need identity propagation without tamper-proof guarantees (e.g., line-of-business metadata) |
+| **Remote (signed)** | Server-side via TTS, ECDSA-signed, requires network call | All contexts requiring full security guarantees, tamper detection, and centralized audit |
+
+#### Mode Selection Logic
+
+When determining which mode to use:
+1. If a preservation context already exists in the request -> route to remote (signed) preservation
+2. If only locally-preservable contexts are present -> local mode is acceptable
+3. If any context requires server-side signing -> route to remote preservation
+4. When in doubt -> default to remote (signed) preservation
+
+#### Message Transport
+
+For message-based async (SQS, SNS, Kafka), preserved context SHOULD be transported as a message attribute rather than embedded in the message body:
+- Attribute name SHOULD be standardized (e.g., `x-transaction-token-preservation-context`)
+- Data type: String (Base64-encoded binary)
+- Idempotency: if the attribute already exists on the message, preserve the existing value (no overwrite)
+- Message attribute limits (e.g., SQS max 10 attributes) MUST be respected — if the limit is reached, the failure SHOULD be logged but the original message MUST still be sent
+
+#### Batch Token Scoping Enhancements
+
+Batch Tokens (Vouchers) SHOULD include:
+- A maximum chain depth counter to prevent infinite rehydration loops
+- A total transaction lifetime that cannot be extended beyond a hard maximum regardless of rehydration count
+- Namespace/use-case scoping so that a batch token obtained for one async workflow cannot be rehydrated in a different workflow context
 
 
 # Security Considerations
@@ -225,21 +592,38 @@ Short token lifetimes reduce the window for token compromise but may cause opera
 ## External Propagation
 Preventing Txn-Tokens from leaving the trusted domain is critical. Organizations MUST implement multiple layers of defense including library-level controls, network-level filtering, and monitoring for external propagation attempts.
 
-## Batch processing security consideration
+## Batch Processing Security Consideration
 
 ### Token Constraining
 
-Batch Tokens MUST be sender-constrained or scoped to specific namespaces. This prevents a compromised service from "stealing" a Batch Token from a queue and successfully minting a 
+Batch Tokens MUST be sender-constrained or scoped to specific namespaces. This prevents a compromised service from "stealing" a Batch Token from a queue and successfully minting a
 Transaction Token for an unrelated flow.
 
 ### Data Mutability and Consent
 
-Asynchronous delays increase the risk that the underlying authorization context has changed (e.g., a user has revoked consent). The TTS SHOULD perform a "freshness check" during 
+Asynchronous delays increase the risk that the underlying authorization context has changed (e.g., a user has revoked consent). The TTS SHOULD perform a "freshness check" during
 rehydration for claims marked as mutable or sensitive.
 
 ### Infinite Exchange Prevention
 
 To prevent a transaction from living indefinitely through repeated rehydrations, the TTS SHOULD implement a maximum chain depth or total transaction lifetime counter within the token metadata.
+
+## Constraint Bypass Prevention
+Organizations MUST ensure that services cannot bypass field-level or schema-level constraints by:
+- Accessing raw token bytes directly (instead of using the validated decode API)
+- Disabling constraint enforcement without authorization
+- Passing tokens through side channels that skip constraint evaluation
+
+Constraint enforcement SHOULD be enabled by default. Disabling constraint enforcement SHOULD require explicit configuration with audit logging.
+
+## Token Format Identification
+Validation libraries MUST be able to quickly identify token type (real token vs placeholder vs handle) without performing full decryption. This enables:
+- Fast-path rejection of placeholder tokens in strict enforcement mode
+- Per-type metrics without expensive decode operations
+- Efficient routing to format-specific decoders
+
+## Supplement Expiration
+Token supplements (constraints, overrides) attached to tokens MUST have independent expiration. Expired supplements MUST be rejected even if the base token is still valid. This prevents stale constraints from being honored indefinitely.
 
 # IANA Considerations
 
